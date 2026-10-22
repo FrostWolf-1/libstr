@@ -1,0 +1,83 @@
+name: Android Emulator Test
+
+on:
+  push:
+  workflow_dispatch:
+    inputs:
+      apk_url:
+        description: 'Optional HTTPS URL of an APK to test instead of building'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  test-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out project
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Gradle cache
+        uses: gradle/actions/setup-gradle@v5
+
+      - name: Prepare APK (build or download)
+        env:
+          APK_URL: ${{ inputs.apk_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -n "${APK_URL:-}" ]]; then
+            [[ "$APK_URL" == https://* ]] || { echo 'Only HTTPS APK links are supported'; exit 1; }
+            curl --fail --location --retry 2 --proto '=https' --max-time 180 "$APK_URL" --output test-app.apk
+            echo 'SOURCE_BUILD=false' >> "$GITHUB_ENV"
+          else
+            test -f ./gradlew || { echo 'Missing gradlew. Provide an Android Gradle project or use the apk_url input.'; exit 1; }
+            chmod +x ./gradlew
+            ./gradlew :app:assembleDebug --stacktrace
+            apk="$(find app/build/outputs/apk/debug -name '*.apk' -type f | head -n 1)"
+            test -n "$apk" || { echo 'No debug APK found'; exit 1; }
+            cp "$apk" test-app.apk
+            echo 'SOURCE_BUILD=true' >> "$GITHUB_ENV"
+          fi
+          test -s test-app.apk
+          unzip -t test-app.apk >/dev/null
+          echo "APK prepared: $(du -h test-app.apk | cut -f1)"
+
+      - name: Enable KVM acceleration
+        shell: bash
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: Boot emulator and test APK
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          profile: pixel_7
+          script: bash .github/scripts/run-emulator-test.sh
+
+      - name: Upload APK, screenshot and debug logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-test-results
+          if-no-files-found: warn
+          retention-days: 7
+          path: |
+            test-app.apk
+            emulator-results/
+            app/build/reports/androidTests/
+            app/build/outputs/androidTest-results/
